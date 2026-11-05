@@ -1,0 +1,5 @@
+package com.crosscopy.crosscopy
+
+import io.flutter.embedding.android.FlutterActivity
+
+class MainActivity : FlutterActivity()
