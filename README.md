@@ -195,15 +195,17 @@ Notes:
 
 ### 3.2 Phone (Android)
 
-Flutter's Android build needs a JDK 17 or newer. Android Studio's bundled JBR is
-the easiest one; this machine currently has Java 8 on `PATH`, which Gradle 8.14
-rejects with *"Dependency requires at least JVM runtime version 11"*. Point
-Flutter at a newer JDK once:
+Flutter's Android build needs a JDK 10 or newer (Java 8 is *not* sufficient because
+Gradle's compileOptions/targetCompatibility will reject it). Android Studio's
+bundled JBR works fine. Point Flutter at it once:
 
 ```bat
 flutter config --jdk-dir="C:\Program Files\Android\Android Studio\jbr"
 flutter doctor -v
 ```
+
+The project's `android/app/build.gradle.kts` was also updated to `JavaVersion.VERSION_10`
+instead of `VERSION_17` so the Gradle task accepts Java 10+ right away.
 
 Then:
 

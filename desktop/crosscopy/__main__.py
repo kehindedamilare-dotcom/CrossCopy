@@ -9,7 +9,6 @@ import sys
 from .app import CrossCopyApp
 from .config import from_args
 
-
 def configure_logging(level: str) -> None:
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
