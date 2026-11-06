@@ -14,6 +14,7 @@ from .hub import Hub, Peer
 from .protocol import MAX_TEXT_BYTES
 from .server import SyncServer
 from .tray import TrayController
+from .ui import SettingsWindow
 
 logger = logging.getLogger("crosscopy.app")
 
@@ -25,9 +26,16 @@ class CrossCopyApp:
         self.backend = backend if backend is not None else SystemClipboard()
         self.core = ClipboardSyncCore(self.backend, max_text_bytes=MAX_TEXT_BYTES)
         self.tray = TrayController(self)
+        self.ui = SettingsWindow(self)
 
         self._loop: asyncio.AbstractEventLoop | None = None
         self._outbox: asyncio.Queue[str] = asyncio.Queue()
+        #: Set when the window saved new settings and the listener must rebind.
+        self._restart_requested = False
+        #: Settings to fall back to when the requested port cannot be bound.
+        self._previous_settings: Settings | None = None
+        #: Human-readable reason the last rebind failed (shown in the window).
+        self.last_error: str | None = None
         self._watcher = ClipboardWatcher(
             self.core,
             self._enqueue_from_watcher,
@@ -49,21 +57,114 @@ class CrossCopyApp:
 
         pump = asyncio.create_task(self._pump_outbox(), name="outbox")
         tray_sync = asyncio.create_task(self._sync_tray(), name="tray-sync")
+        window = (
+            asyncio.create_task(self._open_window_when_ready(), name="window")
+            if self.settings.show_window
+            else None
+        )
         self._watcher.start()
         logger.info("watching the clipboard every %.2fs", self.settings.poll_interval)
         try:
-            await self.server.serve_until_stopped()
+            await self._serve()
         finally:
             self._watcher.stop()
             pump.cancel()
             tray_sync.cancel()
+            if window is not None:
+                window.cancel()
             if self.settings.tray:
                 self.tray.stop()
-            for task in (pump, tray_sync):
+            self.ui.close()
+            for task in (pump, tray_sync, window):
+                if task is None:
+                    continue
                 try:
                     await task
                 except (asyncio.CancelledError, Exception):
                     pass
+
+    async def _open_window_when_ready(self) -> None:
+        """--show-window: the window waits until the port is actually bound."""
+        await self.server.started.wait()
+        await asyncio.to_thread(self.ui.open)
+
+    def _build_server(self) -> SyncServer:
+        return SyncServer(
+            self.settings,
+            self.hub,
+            on_remote_clip=self._apply_remote_clip,
+            read_local_clipboard=self._read_local_clip,
+        )
+
+    async def _serve(self) -> None:
+        """Serve until asked to stop, rebinding the socket after a settings change."""
+        while True:
+            self._restart_requested = False
+            try:
+                await self.server.serve_until_stopped()
+            except OSError as exc:
+                self.last_error = f"Could not use port {self.settings.port}: {exc}"
+                logger.error("could not listen on port %d: %s", self.settings.port, exc)
+                previous, self._previous_settings = self._previous_settings, None
+                if previous is None:
+                    raise
+                # Keep the previously working port instead of dying.
+                self.settings = previous
+                self.server = self._build_server()
+                continue
+
+            if not self._restart_requested:
+                self._previous_settings = None
+                break
+            self.server = self._build_server()
+
+    # -- settings window ---------------------------------------------------
+
+    def apply_settings(self, settings: Settings) -> None:
+        """Adopt new settings from the window and rebind the listener."""
+        if settings == self.settings:
+            return
+        logger.info(
+            "settings changed: port=%d device=%r token=%s",
+            settings.port,
+            settings.device_name,
+            "set" if settings.token else "none",
+        )
+        self._previous_settings = self.settings
+        self.settings = settings
+        self.last_error = None
+        self._restart_requested = True
+        self.request_restart()
+
+    def request_restart(self) -> None:
+        """Stop the current listener; ``_serve`` starts a new one. Thread safe."""
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        try:
+            loop.call_soon_threadsafe(self.server.stop)
+        except RuntimeError:
+            pass
+
+    def status(self) -> dict[str, object]:
+        """Snapshot for the window (called from its own thread)."""
+        try:
+            peers = [peer.name for peer in self.hub.peers()]
+        except Exception:  # pragma: no cover - hub is always usable here
+            peers = []
+        try:
+            url = self.pairing_url()
+        except Exception:  # pragma: no cover
+            url = ""
+        return {
+            "peers": peers,
+            "url": url,
+            "port": self.server.port,
+            "token": self.settings.token,
+            "device_name": self.settings.device_name,
+            "error": self.last_error,
+            "tray": self.tray.running,
+        }
 
     # -- tray --------------------------------------------------------------
 

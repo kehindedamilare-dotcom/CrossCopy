@@ -172,7 +172,9 @@ class TrayController:
             MenuItem(self._status_label, None, enabled=False),
             MenuItem(self._detail_label, None, enabled=False),
             Menu.SEPARATOR,
-            MenuItem("Copy pairing link", self._copy_link, default=True),
+            MenuItem("Open CrossCopy", self._open_window, default=True),
+            MenuItem("Copy pairing link", self._copy_link),
+            Menu.SEPARATOR,
             MenuItem("Open log", self._open_log),
             MenuItem("Start with Windows", self._toggle_startup, checked=self._startup_checked),
             Menu.SEPARATOR,
@@ -217,6 +219,13 @@ class TrayController:
             return ""
 
     # -- actions (pystray calls these on its own thread) -------------------
+
+    def _open_window(self, icon: Any, item: Any) -> None:
+        try:
+            self.app.ui.open()
+        except Exception:
+            logger.exception("could not open the settings window")
+            self.notify("Could not open the window; see the log")
 
     def _copy_link(self, icon: Any, item: Any) -> None:
         url = self._url()

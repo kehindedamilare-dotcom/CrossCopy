@@ -1,11 +1,16 @@
-"""Desktop runtime configuration (CLI flags + environment)."""
+"""Desktop runtime configuration (CLI flags + saved settings + environment)."""
 
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import socket
 from dataclasses import dataclass
+
+from . import settings_store
+
+logger = logging.getLogger("crosscopy.config")
 
 
 def _default_device_name() -> str:
@@ -25,6 +30,7 @@ class Settings:
     device_name: str = ""
     log_level: str = "INFO"
     tray: bool = True
+    show_window: bool = False
 
     def __post_init__(self) -> None:
         if not self.device_name:
@@ -37,11 +43,19 @@ def build_parser() -> argparse.ArgumentParser:
         description="CrossCopy desktop: syncs your clipboard with your phone over Wi-Fi.",
     )
     parser.add_argument("--host", default="0.0.0.0", help="interface to bind (default: all interfaces)")
-    parser.add_argument("--port", type=int, default=8765, help="TCP port to listen on (default: 8765)")
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="TCP port to listen on (default: the saved value, else 8765)",
+    )
     parser.add_argument(
         "--token",
-        default=os.environ.get("CROSSCOPY_TOKEN") or None,
-        help="shared secret the phone must send (env: CROSSCOPY_TOKEN)",
+        default=None,
+        help=(
+            "shared secret the phone must send "
+            "(default: the saved value, else env CROSSCOPY_TOKEN)"
+        ),
     )
     parser.add_argument(
         "--poll-interval",
@@ -54,12 +68,21 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="do not push the current desktop clipboard to a phone that just connected",
     )
-    parser.add_argument("--name", default="", help="device name shown on the phone")
+    parser.add_argument(
+        "--name",
+        default=None,
+        help="device name shown on the phone (default: the saved value, else the PC name)",
+    )
     parser.add_argument("--verbose", action="store_true", help="log every clipboard event")
     parser.add_argument(
         "--no-tray",
         action="store_true",
         help="run without the system tray icon (headless mode)",
+    )
+    parser.add_argument(
+        "--show-window",
+        action="store_true",
+        help="open the CrossCopy window as soon as the server is listening",
     )
     parser.add_argument(
         "--hide-console",
@@ -84,21 +107,40 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def settings_from_args(args: argparse.Namespace) -> Settings:
-    if args.port < 1 or args.port > 65535:
-        raise SystemExit(f"invalid --port {args.port}")
-    if args.poll_interval <= 0.05:
-        raise SystemExit("--poll-interval must be greater than 0.05 seconds")
+def resolve(args: argparse.Namespace) -> Settings:
+    """Merge CLI flags, the saved settings file and the environment variable."""
+    stored = settings_store.load()
+
+    port = args.port if args.port is not None else stored.port
+    if port < 1 or port > 65535:
+        raise SystemExit(f"invalid --port {port}")
+
+    if args.token is not None:
+        token = args.token.strip() or None
+    elif stored.token:
+        token = stored.token
+    else:
+        token = (os.environ.get("CROSSCOPY_TOKEN") or "").strip() or None
+        if token:
+            logger.info("using the CROSSCOPY_TOKEN environment variable")
+
     return Settings(
         host=args.host,
-        port=args.port,
-        token=args.token,
+        port=port,
+        token=token,
         poll_interval=args.poll_interval,
         share_on_connect=not args.no_share_on_connect,
-        device_name=args.name,
+        device_name=(args.name if args.name is not None else stored.device_name),
         log_level="DEBUG" if args.verbose else "INFO",
         tray=not args.no_tray,
+        show_window=bool(getattr(args, "show_window", False)),
     )
+
+
+def settings_from_args(args: argparse.Namespace) -> Settings:
+    if args.poll_interval <= 0.05:
+        raise SystemExit("--poll-interval must be greater than 0.05 seconds")
+    return resolve(args)
 
 
 def from_args(argv: list[str] | None = None) -> Settings:

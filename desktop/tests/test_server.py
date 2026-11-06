@@ -6,9 +6,11 @@ import asyncio
 import base64
 import hashlib
 import json
+import socket
 import time
 import unittest
 import uuid
+from dataclasses import replace
 
 from websockets.asyncio.client import connect
 from websockets.exceptions import InvalidStatus
@@ -113,6 +115,12 @@ async def recv_type(socket, message_type: str, timeout: float = 3.0) -> dict:
                 return frame
 
     return await asyncio.wait_for(_pump(), timeout=timeout)
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
 
 
 async def drain(socket, seconds: float) -> list[dict]:
@@ -336,6 +344,81 @@ class SyncServerTests(unittest.IsolatedAsyncioTestCase):
 
         frames = await drain(socket, 0.8)
         self.assertEqual([f for f in frames if f["type"] == "clipboard.update"], [])
+
+
+class SettingsReloadTests(unittest.IsolatedAsyncioTestCase):
+    """Saving new settings in the window must rebind the listener, not restart the app."""
+
+    async def asyncSetUp(self) -> None:
+        self.clipboard = FakeClipboard()
+        self.app = CrossCopyApp(
+            Settings(
+                host="127.0.0.1",
+                port=0,
+                token="first-token",
+                poll_interval=0.05,
+                share_on_connect=False,
+                device_name="Test PC",
+                tray=False,
+            ),
+            backend=self.clipboard,
+        )
+        self.task = asyncio.create_task(self.app.run())
+        await asyncio.wait_for(self.app.server.started.wait(), timeout=5)
+
+    async def asyncTearDown(self) -> None:
+        self.app.server.stop()
+        await asyncio.wait_for(self.task, timeout=5)
+
+    async def wait_for_server(self, previous, *, exclude_port: int | None = None) -> None:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            server = self.app.server
+            if server is not previous and server.started.is_set():
+                if exclude_port is None or server.port != exclude_port:
+                    return
+            await asyncio.sleep(0.02)
+        self.fail("the server never rebound")
+
+    async def test_new_port_and_token_take_effect_without_restarting(self) -> None:
+        previous = self.app.server
+        port = _free_port()
+        self.app.apply_settings(replace(self.app.settings, port=port, token="second-token"))
+        await self.wait_for_server(previous)
+
+        self.assertEqual(self.app.server.port, port)
+        self.assertEqual(self.app.status()["port"], port)
+        self.assertIn("second-token", str(self.app.status()["url"]))
+
+        phone = await connect(f"ws://127.0.0.1:{port}/?token=second-token")
+        await phone.send(hello_frame("phone-z", "Phone Z"))
+        welcome = await recv_type(phone, "welcome")
+        self.assertEqual(welcome["data"]["name"], "Test PC")
+        await phone.close()
+
+        with self.assertRaises(InvalidStatus):
+            await connect(f"ws://127.0.0.1:{port}/?token=first-token")
+
+    async def test_busy_port_keeps_the_app_serving(self) -> None:
+        previous = self.app.server
+        blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        blocker.bind(("127.0.0.1", 0))
+        blocker.listen(1)
+        busy = int(blocker.getsockname()[1])
+        self.addCleanup(blocker.close)
+
+        self.app.apply_settings(replace(self.app.settings, port=busy))
+        await self.wait_for_server(previous, exclude_port=busy)
+
+        self.assertIsNotNone(self.app.last_error)
+        self.assertNotEqual(self.app.server.port, busy)
+
+        # The old token still works because the previous settings were restored.
+        port = self.app.server.port
+        phone = await connect(f"ws://127.0.0.1:{port}/?token=first-token")
+        await phone.send(hello_frame("phone-y", "Phone Y"))
+        await recv_type(phone, "welcome")
+        await phone.close()
 
 
 if __name__ == "__main__":

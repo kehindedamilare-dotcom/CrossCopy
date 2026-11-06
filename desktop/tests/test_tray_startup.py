@@ -17,6 +17,11 @@ class FakeApp:
         self.settings = SimpleNamespace(host="0.0.0.0", token="abc")
         self.stopped = False
         self.copied: str | None = None
+        self.window_opened = False
+        self.ui = SimpleNamespace(open=self._open_window)
+
+    def _open_window(self) -> None:
+        self.window_opened = True
 
     def pairing_url(self) -> str:
         return "ws://192.168.1.5:8765?token=abc"
@@ -57,11 +62,16 @@ class TrayTests(unittest.TestCase):
     @unittest.skipUnless(tray.Menu is not None, "pystray is not installed")
     def test_menu_exposes_the_expected_actions(self) -> None:
         labels = [str(item) for item in self.tray._build_menu()]
+        self.assertIn("Open CrossCopy", labels)
         self.assertIn("Copy pairing link", labels)
         self.assertIn("Open log", labels)
         self.assertIn("Start with Windows", labels)
         self.assertIn("Quit CrossCopy", labels)
         self.assertIn("Waiting for a phone", labels)
+
+    def test_menu_opens_the_window(self) -> None:
+        self.tray._open_window(None, None)
+        self.assertTrue(self.app.window_opened)
 
     def test_quit_stops_the_app(self) -> None:
         self.tray._quit(None, None)
