@@ -6,7 +6,9 @@ class FakeClipboard implements ClipboardBackend {
   FakeClipboard([this.value]);
 
   String? value;
+  ImageClip? image;
   final List<String> writes = <String>[];
+  final List<ImageClip> imageWrites = <ImageClip>[];
   bool failWrites = false;
 
   @override
@@ -17,6 +19,18 @@ class FakeClipboard implements ClipboardBackend {
     if (failWrites) throw StateError('clipboard locked');
     writes.add(text);
     value = text;
+    image = null;
+  }
+
+  @override
+  Future<ImageClip?> readImage() async => image;
+
+  @override
+  Future<void> writeImage(ImageClip clip) async {
+    if (failWrites) throw StateError('clipboard locked');
+    imageWrites.add(clip);
+    image = clip;
+    value = null;
   }
 }
 

@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import 'protocol.dart';
 import 'services/connection_service.dart';
 import 'sync_controller.dart';
 
@@ -227,17 +228,46 @@ class _HomeScreenState extends State<HomeScreen> {
                       color: theme.colorScheme.surfaceContainerHighest,
                       borderRadius: BorderRadius.circular(12),
                     ),
-                    child: _sync.lastText == null
-                        ? Text(
-                            'Nothing synced yet.\nCopy text on either device.',
-                            style: theme.textTheme.bodySmall?.copyWith(
-                              color: theme.colorScheme.onSurfaceVariant,
-                            ),
-                          )
-                        : SelectableText(
-                            _displayText(_sync.lastText!),
-                            style: theme.textTheme.bodyMedium,
+                    child: switch (_sync.lastClip) {
+                      null => Text(
+                          'Nothing synced yet.\nCopy text or an image on either device.',
+                          style: theme.textTheme.bodySmall?.copyWith(
+                            color: theme.colorScheme.onSurfaceVariant,
                           ),
+                        ),
+                      TextClip(:final text) => SelectableText(
+                          _displayText(text),
+                          style: theme.textTheme.bodyMedium,
+                        ),
+                      ImageClip(:final png, :final width, :final height) => Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            ClipRRect(
+                              borderRadius: BorderRadius.circular(8),
+                              child: Image.memory(
+                                png,
+                                width: double.infinity,
+                                height: 180,
+                                fit: BoxFit.contain,
+                                gaplessPlayback: true,
+                                errorBuilder: (context, error, stack) => Text(
+                                  'Image preview unavailable',
+                                  style: theme.textTheme.bodySmall,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            Text(
+                              width > 0 && height > 0
+                                  ? 'Image ${width}x$height \u00b7 ${(png.length / 1024).round()} KB'
+                                  : 'Image \u00b7 ${(png.length / 1024).round()} KB',
+                              style: theme.textTheme.labelSmall?.copyWith(
+                                color: theme.colorScheme.onSurfaceVariant,
+                              ),
+                            ),
+                          ],
+                        ),
+                    },
                   ),
                   const SizedBox(height: 10),
                   Text(

@@ -17,6 +17,8 @@ The envelope, routing, replay protection and echo suppression stay untouched.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import time
@@ -30,12 +32,17 @@ PROTOCOL_VERSION = 1
 #: Largest clipboard text we are willing to relay (UTF-8 bytes, after decoding).
 MAX_TEXT_BYTES = 64 * 1024
 
-#: Hard cap for a single websocket frame, including JSON overhead.
-MAX_FRAME_BYTES = 256 * 1024
+#: Largest clipboard image we relay (PNG bytes). 8 MiB covers 4K screenshots.
+MAX_IMAGE_BYTES = 8 * 1024 * 1024
+
+#: Hard cap for a single websocket frame: base64 inflates images by ~4/3.
+MAX_FRAME_BYTES = MAX_IMAGE_BYTES * 4 // 3 + 512 * 1024
 
 #: Supported ``data["kind"]`` values. "files" arrives in Phase 2.
 CONTENT_TEXT = "text"
-SUPPORTED_CONTENT_KINDS = frozenset({CONTENT_TEXT})
+CONTENT_IMAGE = "image"
+SUPPORTED_CONTENT_KINDS = frozenset({CONTENT_TEXT, CONTENT_IMAGE})
+CONTENT_MIME = {CONTENT_TEXT: "text/plain", CONTENT_IMAGE: "image/png"}
 
 
 class MessageType(str, Enum):
@@ -87,6 +94,64 @@ def text_size(text: str) -> int:
 
 def new_id() -> str:
     return uuid.uuid4().hex
+
+
+def image_digest(png: bytes) -> str:
+    """Content fingerprint of PNG bytes.
+
+    Both ends store and re-read the *same* PNG bytes, so the digest survives a
+    clipboard round-trip; that is what lets echo suppression recognise our own
+    write without decoding pixels.
+    """
+    return hashlib.sha256(png).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class Clip:
+    """One clipboard item: either text or a PNG image."""
+
+    kind: str
+    text: str | None = None
+    png: bytes | None = None
+    width: int = 0
+    height: int = 0
+
+    @property
+    def is_text(self) -> bool:
+        return self.kind == CONTENT_TEXT
+
+    @property
+    def is_image(self) -> bool:
+        return self.kind == CONTENT_IMAGE
+
+    @property
+    def digest(self) -> str:
+        if self.kind == CONTENT_IMAGE:
+            return image_digest(self.png or b"")
+        return text_digest(self.text or "")
+
+    @property
+    def size(self) -> int:
+        if self.kind == CONTENT_IMAGE:
+            return len(self.png or b"")
+        return text_size(self.text or "")
+
+    def describe(self) -> str:
+        if self.kind == CONTENT_IMAGE:
+            kib = self.size / 1024
+            size_text = f"{kib:.0f} KB" if kib >= 10 else f"{kib:.1f} KB"
+            if self.width and self.height:
+                return f"image {self.width}x{self.height} ({size_text})"
+            return f"image ({size_text})"
+        return f"text {self.size} chars"
+
+
+def text_clip(text: str) -> Clip:
+    return Clip(kind=CONTENT_TEXT, text=canonical_text(text))
+
+
+def image_clip(png: bytes, width: int = 0, height: int = 0) -> Clip:
+    return Clip(kind=CONTENT_IMAGE, png=png, width=width, height=height)
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +233,49 @@ def decode(raw: str | bytes) -> Message:
     )
 
 
+def extract_clip(
+    message: Message,
+    *,
+    max_text_bytes: int = MAX_TEXT_BYTES,
+    max_image_bytes: int = MAX_IMAGE_BYTES,
+) -> Clip:
+    """Validate a ``clipboard.update`` payload and return the clipboard item."""
+    kind = message.data.get("kind")
+    if kind == CONTENT_TEXT:
+        return text_clip(extract_text(message, max_text_bytes))
+
+    if kind != CONTENT_IMAGE:
+        raise ProtocolError("unsupported_kind", f"content kind {kind!r} is not supported")
+
+    encoded = message.data.get("data")
+    if not isinstance(encoded, str):
+        raise ProtocolError("invalid_payload", "'data' must be a base64 string")
+
+    try:
+        png = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ProtocolError("invalid_payload", "image data is not valid base64") from exc
+
+    if not png:
+        raise ProtocolError("invalid_payload", "image data is empty")
+    if len(png) > max_image_bytes:
+        raise ProtocolError(
+            "image_too_large", f"{len(png)} bytes exceeds the {max_image_bytes} byte limit"
+        )
+
+    claimed = message.data.get("digest")
+    if isinstance(claimed, str) and claimed and claimed != image_digest(png):
+        raise ProtocolError("digest_mismatch", "image bytes do not match their digest")
+
+    width = message.data.get("width")
+    height = message.data.get("height")
+    return image_clip(
+        png,
+        width=width if isinstance(width, int) and width > 0 else 0,
+        height=height if isinstance(height, int) and height > 0 else 0,
+    )
+
+
 def extract_text(message: Message, max_bytes: int = MAX_TEXT_BYTES) -> str:
     """Pull clipboard text out of a message or explain why we cannot."""
     kind = message.data.get("kind")
@@ -198,8 +306,34 @@ def make_text_update(origin: str, text: str) -> Message:
     )
 
 
+def make_image_update(origin: str, png: bytes, width: int = 0, height: int = 0) -> Message:
+    if len(png) > MAX_IMAGE_BYTES:
+        raise ValueError(f"image exceeds {MAX_IMAGE_BYTES} bytes")
+    data: dict[str, Any] = {
+        "kind": CONTENT_IMAGE,
+        "mime": CONTENT_MIME[CONTENT_IMAGE],
+        "data": base64.b64encode(png).decode("ascii"),
+        "digest": image_digest(png),
+        "bytes": len(png),
+    }
+    if width and height:
+        data["width"] = width
+        data["height"] = height
+    return Message(type=MessageType.CLIPBOARD_UPDATE.value, origin=origin, data=data)
+
+
+def make_clip_update(origin: str, clip: Clip) -> Message:
+    if clip.is_image:
+        return make_image_update(origin, clip.png or b"", clip.width, clip.height)
+    return make_text_update(origin, clip.text or "")
+
+
 def make_snapshot(origin: str, text: str) -> Message:
-    message = make_text_update(origin, text)
+    return make_clip_snapshot(origin, text_clip(text))
+
+
+def make_clip_snapshot(origin: str, clip: Clip) -> Message:
+    message = make_clip_update(origin, clip)
     return Message(
         type=MessageType.CLIPBOARD_SNAPSHOT.value,
         id=message.id,

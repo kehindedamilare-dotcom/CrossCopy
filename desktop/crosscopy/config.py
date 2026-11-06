@@ -24,6 +24,7 @@ class Settings:
     share_on_connect: bool = True
     device_name: str = ""
     log_level: str = "INFO"
+    tray: bool = True
 
     def __post_init__(self) -> None:
         if not self.device_name:
@@ -55,11 +56,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--name", default="", help="device name shown on the phone")
     parser.add_argument("--verbose", action="store_true", help="log every clipboard event")
+    parser.add_argument(
+        "--no-tray",
+        action="store_true",
+        help="run without the system tray icon (headless mode)",
+    )
+    parser.add_argument(
+        "--hide-console",
+        action="store_true",
+        help="log only to the file (no console output); implied by a windowed build",
+    )
+    parser.add_argument(
+        "--install-startup",
+        action="store_true",
+        help="start CrossCopy with Windows, then exit",
+    )
+    parser.add_argument(
+        "--uninstall-startup",
+        action="store_true",
+        help="stop starting CrossCopy with Windows, then exit",
+    )
+    parser.add_argument(
+        "--startup-status",
+        action="store_true",
+        help="print whether CrossCopy starts with Windows, then exit",
+    )
     return parser
 
 
-def from_args(argv: list[str] | None = None) -> Settings:
-    args = build_parser().parse_args(argv)
+def settings_from_args(args: argparse.Namespace) -> Settings:
     if args.port < 1 or args.port > 65535:
         raise SystemExit(f"invalid --port {args.port}")
     if args.poll_interval <= 0.05:
@@ -72,7 +97,12 @@ def from_args(argv: list[str] | None = None) -> Settings:
         share_on_connect=not args.no_share_on_connect,
         device_name=args.name,
         log_level="DEBUG" if args.verbose else "INFO",
+        tray=not args.no_tray,
     )
+
+
+def from_args(argv: list[str] | None = None) -> Settings:
+    return settings_from_args(build_parser().parse_args(argv))
 
 
 def lan_addresses() -> list[str]:

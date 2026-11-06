@@ -15,7 +15,7 @@ void main() {
     expect(find.text('Pairing token (optional)'), findsOneWidget);
     expect(find.text('Connect'), findsOneWidget);
     expect(find.text('Push my clipboard'), findsOneWidget);
-    expect(find.text('Nothing synced yet.\nCopy text on either device.'), findsOneWidget);
+    expect(find.text('Nothing synced yet.\nCopy text or an image on either device.'), findsOneWidget);
 
     expect(tester.takeException(), isNull);
   });

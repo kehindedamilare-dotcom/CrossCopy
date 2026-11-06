@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
 
@@ -9,10 +10,14 @@ const int protocolVersion = 1;
 /// Largest clipboard text frame the desktop accepts.
 const int maxTextBytes = 64 * 1024;
 
-/// Hard cap for one websocket frame (mirrors the desktop).
-const int maxFrameBytes = 256 * 1024;
+/// Largest clipboard image the desktop accepts (PNG bytes).
+const int maxImageBytes = 8 * 1024 * 1024;
+
+/// Hard cap for one websocket frame: base64 inflates images by ~4/3.
+const int maxFrameBytes = maxImageBytes * 4 ~/ 3 + 512 * 1024;
 
 const String textContentKind = 'text';
+const String imageContentKind = 'image';
 
 /// Message types shared with the desktop. Phase 2 adds `files` here.
 abstract final class MessageTypes {
@@ -42,6 +47,58 @@ String textDigest(String text) =>
     sha256.convert(utf8.encode(canonicalizeText(text))).toString();
 
 int textSize(String text) => utf8.encode(text).length;
+
+/// Content fingerprint of PNG bytes; identical bytes round-trip unchanged.
+String imageDigest(Uint8List png) => sha256.convert(png).toString();
+
+/// One clipboard item: either text or a PNG image.
+sealed class ClipContent {
+  const ClipContent();
+
+  String get digest;
+
+  int get size;
+
+  String describe();
+}
+
+final class TextClip extends ClipContent {
+  const TextClip(this.text);
+
+  final String text;
+
+  @override
+  String get digest => textDigest(text);
+
+  @override
+  int get size => textSize(text);
+
+  @override
+  String describe() => '$size chars';
+}
+
+final class ImageClip extends ClipContent {
+  const ImageClip(this.png, {this.width = 0, this.height = 0});
+
+  final Uint8List png;
+  final int width;
+  final int height;
+
+  @override
+  String get digest => imageDigest(png);
+
+  @override
+  int get size => png.length;
+
+  @override
+  String describe() {
+    final kib = size / 1024;
+    final sizeText = kib >= 10 ? '${kib.round()} KB' : '${kib.toStringAsFixed(1)} KB';
+    return width > 0 && height > 0
+        ? 'image ${width}x$height ($sizeText)'
+        : 'image ($sizeText)';
+  }
+}
 
 String _newMessageId() {
   final random = Random.secure();
@@ -101,19 +158,87 @@ class SyncMessage {
         },
       );
 
+  factory SyncMessage.clipboardImage({
+    required String origin,
+    required Uint8List png,
+    int width = 0,
+    int height = 0,
+  }) =>
+      SyncMessage(
+        type: MessageTypes.clipboardUpdate,
+        origin: origin,
+        data: {
+          'kind': imageContentKind,
+          'mime': 'image/png',
+          'data': base64Encode(png),
+          'digest': imageDigest(png),
+          'bytes': png.length,
+          if (width > 0 && height > 0) 'width': width,
+          if (width > 0 && height > 0) 'height': height,
+        },
+      );
+
+  factory SyncMessage.clipboardContentUpdate({
+    required String origin,
+    required ClipContent clip,
+  }) =>
+      switch (clip) {
+        TextClip(:final text) => SyncMessage.clipboardUpdate(origin: origin, text: text),
+        ImageClip(:final png, :final width, :final height) =>
+          SyncMessage.clipboardImage(origin: origin, png: png, width: width, height: height),
+      };
+
   factory SyncMessage.shareRequest() => SyncMessage(type: MessageTypes.clipboardShare);
 
   factory SyncMessage.ping(int sequence) =>
       SyncMessage(type: MessageTypes.ping, data: {'n': sequence});
 
-  /// The text carried by a clipboard message, or null if this payload kind is
+  /// The clipboard item carried by a message, or null when the payload kind is
   /// not understood (for example Phase 2 file payloads).
+  ClipContent? get clipboardContent {
+    final kind = data['kind'];
+
+    if (kind == textContentKind) {
+      final text = data['text'];
+      if (text is! String) return null;
+      if (textSize(text) > maxTextBytes) return null;
+      return TextClip(canonicalizeText(text));
+    }
+
+    if (kind == imageContentKind) {
+      final encoded = data['data'];
+      if (encoded is! String) return null;
+
+      final Uint8List png;
+      try {
+        png = base64Decode(encoded);
+      } catch (_) {
+        return null;
+      }
+      if (png.isEmpty || png.length > maxImageBytes) return null;
+
+      final claimed = data['digest'];
+      if (claimed is String && claimed.isNotEmpty && claimed != imageDigest(png)) {
+        return null;
+      }
+
+      final width = data['width'];
+      final height = data['height'];
+      return ImageClip(
+        png,
+        width: width is int && width > 0 ? width : 0,
+        height: height is int && height > 0 ? height : 0,
+      );
+    }
+
+    return null;
+  }
+
+  /// The text carried by a clipboard message, or null for images and unknown
+  /// payload kinds.
   String? get clipboardText {
-    if (data['kind'] != textContentKind) return null;
-    final text = data['text'];
-    if (text is! String) return null;
-    if (textSize(text) > maxTextBytes) return null;
-    return text;
+    final content = clipboardContent;
+    return content is TextClip ? content.text : null;
   }
 
   String encode() => jsonEncode({

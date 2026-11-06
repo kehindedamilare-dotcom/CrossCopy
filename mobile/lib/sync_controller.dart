@@ -53,7 +53,7 @@ class SyncController extends ChangeNotifier with WidgetsBindingObserver {
   bool _polling = false;
   bool _disposed = false;
   String? _serverName;
-  String? _lastText;
+  ClipContent? _lastClip;
   String? _lastSource;
   DateTime? _lastAt;
   String _connectedHost = '';
@@ -61,7 +61,8 @@ class SyncController extends ChangeNotifier with WidgetsBindingObserver {
 
   SyncStatus get status => _status;
   String? get serverName => _serverName;
-  String? get lastText => _lastText;
+  ClipContent? get lastClip => _lastClip;
+  String? get lastText => _lastClip is TextClip ? (_lastClip! as TextClip).text : null;
   String? get lastSource => _lastSource;
   DateTime? get lastAt => _lastAt;
   Duration? get latency => _connection.latency;
@@ -107,23 +108,23 @@ class SyncController extends ChangeNotifier with WidgetsBindingObserver {
     _notify();
   }
 
-  /// Manual push, for text copied while the phone was disconnected.
+  /// Manual push, for content copied while the phone was disconnected.
   Future<void> pushCurrentClipboard() async {
     if (!isConnected) {
       _log('Not connected', isError: true);
       return;
     }
 
-    final text = await _clipboard.readCurrent();
-    if (text == null) {
+    final clip = await _clipboard.readCurrentClip();
+    if (clip == null) {
       _log('Clipboard is empty or unreadable', isError: true);
       return;
     }
 
-    _connection.send(SyncMessage.clipboardUpdate(origin: _clientId, text: text));
-    _clipboard.observeLocal(text);
-    _remember(text, 'phone');
-    _log('Pushed clipboard to desktop');
+    _connection.send(SyncMessage.clipboardContentUpdate(origin: _clientId, clip: clip));
+    _clipboard.observeLocalClip(clip);
+    _remember(clip, 'phone');
+    _log('Pushed ${clip.describe()} to desktop');
   }
 
   // -- websocket events --------------------------------------------------
@@ -170,17 +171,17 @@ class SyncController extends ChangeNotifier with WidgetsBindingObserver {
       _seenIds.remove(_seenIds.first);
     }
 
-    final text = message.clipboardText;
-    if (text == null) {
+    final clip = message.clipboardContent;
+    if (clip == null) {
       _log('Ignored an unsupported clipboard payload', isError: true);
       return;
     }
 
     try {
-      final applied = await _clipboard.applyRemote(text);
+      final applied = await _clipboard.applyRemoteClip(clip);
       if (!applied) return;
-      _remember(text, 'pc');
-      _log('Received ${_preview(text)}');
+      _remember(clip, 'pc');
+      _log('Received ${_preview(clip)}');
     } catch (error) {
       _log('Could not update the clipboard: $error', isError: true);
     }
@@ -210,13 +211,13 @@ class SyncController extends ChangeNotifier with WidgetsBindingObserver {
 
     _polling = true;
     try {
-      final text = await _clipboard.readCurrent();
-      if (text == null) return;
+      final clip = await _clipboard.readCurrentClip();
+      if (clip == null) return;
 
-      final fresh = _clipboard.observeLocal(text);
+      final fresh = _clipboard.observeLocalClip(clip);
       if (fresh == null) return; // unchanged, or the echo of a remote write
 
-      _connection.send(SyncMessage.clipboardUpdate(origin: _clientId, text: fresh));
+      _connection.send(SyncMessage.clipboardContentUpdate(origin: _clientId, clip: fresh));
       _remember(fresh, 'phone');
       _log('Sent ${_preview(fresh)}');
     } finally {
@@ -240,8 +241,8 @@ class SyncController extends ChangeNotifier with WidgetsBindingObserver {
 
   // -- helpers -----------------------------------------------------------
 
-  void _remember(String text, String source) {
-    _lastText = text;
+  void _remember(ClipContent clip, String source) {
+    _lastClip = clip;
     _lastSource = source;
     _lastAt = DateTime.now();
     _notify();
@@ -259,10 +260,11 @@ class SyncController extends ChangeNotifier with WidgetsBindingObserver {
     if (!_disposed) notifyListeners();
   }
 
-  static String _preview(String text) {
-    final compact = text.replaceAll(RegExp(r'\s+'), ' ').trim();
+  static String _preview(ClipContent clip) {
+    if (clip is! TextClip) return clip.describe();
+    final compact = clip.text.replaceAll(RegExp(r'\s+'), ' ').trim();
     final short = compact.length <= 40 ? compact : '${compact.substring(0, 40)}...';
-    return '${text.length} chars: $short';
+    return '${clip.text.length} chars: $short';
   }
 
   static String _randomClientId() {

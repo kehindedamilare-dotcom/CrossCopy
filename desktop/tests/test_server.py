@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import time
@@ -12,25 +13,56 @@ import uuid
 from websockets.asyncio.client import connect
 from websockets.exceptions import InvalidStatus
 
+from crosscopy import protocol
 from crosscopy.app import CrossCopyApp
 from crosscopy.config import Settings
 
 TOKEN = "test-token"
+PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+)
 
 
 class FakeClipboard:
     """Stands in for the Windows clipboard so tests never touch the real one."""
 
     def __init__(self) -> None:
-        self.value: str | None = None
-        self.writes: list[str] = []
+        self.item: protocol.Clip | None = None
+        self.writes: list[protocol.Clip] = []
 
-    def read_text(self) -> str | None:
-        return self.value
+    @property
+    def value(self) -> str | None:
+        return self.item.text if self.item is not None and self.item.is_text else None
 
-    def write_text(self, text: str) -> None:
-        self.value = text
-        self.writes.append(text)
+    @value.setter
+    def value(self, text: str | None) -> None:
+        self.item = protocol.text_clip(text) if text else None
+
+    def read_item(self) -> protocol.Clip | None:
+        return self.item
+
+    def write_item(self, clip: protocol.Clip) -> None:
+        self.item = clip
+        self.writes.append(clip)
+
+
+def image_frame(png: bytes, *, origin: str = "phone-a") -> str:
+    return json.dumps(
+        {
+            "v": 1,
+            "type": "clipboard.update",
+            "id": uuid.uuid4().hex,
+            "origin": origin,
+            "ts": time.time(),
+            "data": {
+                "kind": "image",
+                "mime": "image/png",
+                "data": base64.b64encode(png).decode("ascii"),
+                "digest": hashlib.sha256(png).hexdigest(),
+                "bytes": len(png),
+            },
+        }
+    )
 
 
 def hello_frame(client_id: str, name: str) -> str:
@@ -117,6 +149,7 @@ class SyncServerTests(unittest.IsolatedAsyncioTestCase):
             poll_interval=0.05,
             share_on_connect=overrides.get("share_on_connect", False),
             device_name="Test PC",
+            tray=False,
         )
         app = CrossCopyApp(settings, backend=self.clipboard)
         task = asyncio.create_task(app.run())
@@ -140,7 +173,7 @@ class SyncServerTests(unittest.IsolatedAsyncioTestCase):
         data = welcome["data"]
         self.assertEqual(data["platform"], "windows")
         self.assertEqual(data["protocol"], 1)
-        self.assertEqual(data["capabilities"], ["text"])
+        self.assertEqual(data["capabilities"], ["image", "text"])
         self.assertEqual(data["name"], "Test PC")
 
     async def test_missing_token_is_rejected(self) -> None:
@@ -191,6 +224,47 @@ class SyncServerTests(unittest.IsolatedAsyncioTestCase):
         quiet = await drain(second, 0.8)
         self.assertEqual([f for f in quiet if f["type"].startswith("clipboard.")], [])
         self.assertEqual(self.clipboard.value, "shared text")
+
+    async def test_image_from_one_phone_reaches_the_other_and_never_comes_back(self) -> None:
+        first, _ = await self.connect_phone("phone-a", "Phone A")
+        second, _ = await self.connect_phone("phone-b", "Phone B")
+        await asyncio.sleep(0.1)
+        await drain(first, 0.1)
+        await drain(second, 0.1)
+
+        await first.send(image_frame(PNG))
+        delivered = await recv_type(second, "clipboard.update")
+        self.assertEqual(delivered["data"]["kind"], "image")
+        self.assertEqual(delivered["data"]["data"], base64.b64encode(PNG).decode())
+        self.assertEqual(delivered["origin"], "phone-a")
+
+        quiet = await drain(second, 0.8)
+        self.assertEqual([f for f in quiet if f["type"].startswith("clipboard.")], [])
+        self.assertIsNotNone(self.clipboard.item)
+        self.assertTrue(self.clipboard.item.is_image)
+        self.assertEqual(self.clipboard.item.png, PNG)
+
+    async def test_tampered_image_is_refused(self) -> None:
+        socket, _ = await self.connect_phone()
+        frame = json.loads(image_frame(PNG))
+        frame["data"]["digest"] = "0" * 64
+        await socket.send(json.dumps(frame))
+
+        error = await recv_type(socket, "error")
+        self.assertEqual(error["data"]["code"], "digest_mismatch")
+        self.assertIsNone(self.clipboard.item)
+
+    async def test_desktop_image_is_shared_on_connect(self) -> None:
+        app, task = await self.start_app(share_on_connect=True)
+        try:
+            app.core.apply_item(protocol.image_clip(PNG, 1, 1))
+            phone, _ = await self.connect_phone(app=app)
+            snapshot = await recv_type(phone, "clipboard.snapshot")
+            self.assertEqual(snapshot["data"]["kind"], "image")
+            self.assertEqual(snapshot["data"]["data"], base64.b64encode(PNG).decode())
+        finally:
+            app.server.stop()
+            await asyncio.wait_for(task, timeout=5)
 
     async def test_replayed_message_is_ignored(self) -> None:
         first, _ = await self.connect_phone("phone-a", "Phone A")

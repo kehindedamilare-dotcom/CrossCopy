@@ -1,13 +1,14 @@
 # CrossCopy
 
 A universal clipboard for one Windows laptop and one or more Android phones, over
-the local Wi-Fi network. Copy text on the laptop and it appears on the phone;
-copy on the phone and it appears on the laptop. No cloud, no account, no pairing
-service.
+the local Wi-Fi network. Copy text **or an image** on the laptop and it appears on
+the phone; copy on the phone and it appears on the laptop. Runs in the system
+tray, can start with Windows, and needs no cloud, account or pairing service.
 
-**Phase 1 scope:** text only. The wire format, clipboard abstraction and UI are
-built so file sync can be added as a new content kind without touching the
-transport or the echo-suppression logic (see [Extending to Phase 2](#extending-to-phase-2-files)).
+**Current scope:** text and PNG images. The wire format, clipboard abstraction
+and UI are built so file sync can be added as a new content kind without
+touching the transport or the echo-suppression logic (see
+[Extending to Phase 2](#extending-to-phase-2-files)).
 
 ---
 
@@ -16,9 +17,10 @@ transport or the echo-suppression logic (see [Extending to Phase 2](#extending-t
 ```
 ┌──────────────────────────── Windows laptop ────────────────────────────┐
 │                                                                        │
-│  pyperclip  ←→  ClipboardSyncCore  ←→  asyncio outbox  →  Hub          │
+│  text (pyperclip) / images (Win32) ←→ ClipboardSyncCore ←→ outbox → Hub│
 │                        ↑                                   │           │
 │            ClipboardWatcher thread (poll every 0.35 s)     │           │
+│  system tray ← status, copy link, autostart, quit          │           │
 │                                                WebSocket server :8765  │
 └────────────────────────────────────┬───────────────────────────────────┘
                                      │  ws://192.168.x.y:8765?token=…
@@ -41,22 +43,27 @@ to all of them except the sender.
 
 | File | Responsibility |
 | --- | --- |
-| `protocol.py` | Frame envelope, message types, text canonicalization, digests, validation and size limits. Phase-agnostic. |
-| `clipboard.py` | `ClipboardBackend` interface, `PyperclipClipboard`, `ClipboardSyncCore` (echo cancellation), `ClipboardWatcher` (background polling thread). |
+| `protocol.py` | Frame envelope, message types, `Clip` (text or PNG), canonicalization, digests, validation and size limits. |
+| `clipboard.py` | `ClipboardBackend` interface, `SystemClipboard` (pyperclip + Win32 images), `ClipboardSyncCore` (echo cancellation), `ClipboardWatcher` (background polling thread). |
+| `imageclip.py` | Raw Win32 clipboard access for images: reads the `PNG` format byte-exactly, falls back to `CF_DIB`, writes both formats. |
 | `hub.py` | Connected-peer registry, per-peer send lock, broadcast, replay window. |
 | `server.py` | WebSocket server, token auth, handshake, routing, acks/errors, graceful shutdown. |
-| `app.py` | Wiring: watcher thread → asyncio queue → broadcast, remote text → clipboard, signal handling. |
-| `config.py` | CLI flags, LAN address discovery for the startup banner. |
+| `app.py` | Wiring: watcher thread → asyncio queue → broadcast, remote content → clipboard, tray lifecycle, signal handling. |
+| `tray.py` | System-tray icon: status, copy pairing link, open log, start-with-Windows toggle, quit. |
+| `startup.py` | Per-user `HKCU\…\Run` autostart entry (no admin, no console flash). |
+| `logfile.py` | `%LOCALAPPDATA%\CrossCopy\crosscopy.log` logging shared by CLI and tray. |
+| `config.py` | CLI flags, LAN address discovery for the startup banner and pairing URL. |
 
 ### Mobile modules (`mobile/lib/`)
 
 | File | Responsibility |
 | --- | --- |
-| `protocol.dart` | Mirrors the Python envelope exactly (same version, same validation). |
-| `services/clipboard_service.dart` | `ClipboardBackend`, `SystemClipboardBackend`, `ClipboardSyncCore`. |
+| `protocol.dart` | Mirrors the Python envelope exactly (same version, same validation, text or PNG `ClipContent`). |
+| `services/clipboard_service.dart` | `ClipboardBackend`, `SystemClipboardBackend` (text + image channel), `ClipboardSyncCore`. |
 | `services/connection_service.dart` | Socket lifecycle, `hello`/`welcome`, heartbeat, reconnect with exponential backoff + jitter. |
-| `sync_controller.dart` | Glue: polling, applying remote text, dedupe, lifecycle handling, activity log. |
-| `main.dart` | Material 3 UI: pairing form, last-synced preview, manual push, activity list. |
+| `sync_controller.dart` | Glue: polling, applying remote content, dedupe, lifecycle handling, activity log. |
+| `main.dart` | Material 3 UI: pairing form, last-synced preview (text or image), manual push, activity list. |
+| `MainActivity.kt` (Android) | `crosscopy/clipboard_image` channel: reads/writes clipboard images through a `FileProvider`, normalising to PNG. |
 
 ### Wire protocol (v1)
 
@@ -77,6 +84,32 @@ One JSON object per WebSocket text frame:
   }
 }
 ```
+
+An image uses the same envelope with a different `data.kind`:
+
+```json
+{
+  "v": 1,
+  "type": "clipboard.update",
+  "id": "8c21…",
+  "origin": "android-3f9c1a2b4d6e",
+  "ts": 1762345678.900,
+  "data": {
+    "kind": "image",
+    "mime": "image/png",
+    "data": "iVBORw0KGgo…",
+    "digest": "sha256…",
+    "bytes": 48213,
+    "width": 1080,
+    "height": 1920
+  }
+}
+```
+
+| `data.kind` | Payload | Limits |
+| --- | --- | --- |
+| `text` | `text` (string) | 64 KiB UTF-8 |
+| `image` | `data` (base64 PNG), `mime`, optional `width`/`height` | 8 MiB PNG |
 
 | Type | Direction | Meaning |
 | --- | --- | --- |
@@ -107,23 +140,27 @@ so it is handled with several independent layers.
 3. Desktop's watcher polls the clipboard, sees `"hi"`, and would push it back.
 4. Phone applies it, its poller sees `"hi"`, and pushes again… forever.
 
+The same loop applies to an image copied on either side. Because the machinery
+works on a content digest rather than on strings, it needed no changes for
+images: `Clip.digest` is the SHA-256 of the PNG bytes (which round-trip
+byte-for-byte on both platforms) instead of the canonical text.
+
 ### The five guards
 
 1. **One canonical form per text.** `canonicalizeText()` converts `\r\n` and
    `\r` to `\n` on both sides. This matters because `pyperclip` returns CRLF on
    Windows while Android uses LF; without it, every applied write would look
    like brand-new content to the sender.
-2. **Known-state tracking.** Each side remembers the canonical text it believes
-   is on the clipboard (`_lastObserved`). A poll that returns that same text is
-   not a change, so it is never emitted.
+2. **Known-state tracking.** Each side remembers the digest of the item it
+   believes is on the clipboard (`_lastObserved`). A poll that returns that same
+   content is not a change, so it is never emitted.
 3. **Suppression by content digest, written *before* the clipboard write.** When
-   remote text is applied, its SHA-256 digest is recorded with a 5-second TTL
-   *before* `pyperclip.copy()` / `FlutterClipboard.copy()` runs. Any poll that
-   races in between the write and the state update is recognized as an echo.
-   The previous clipboard value is suppressed briefly (1.5 s) too, which
-   swallows reads that were already in flight when the remote update landed.
-   Entries expire, so deliberately copying the same text again later still
-   propagates.
+   remote content is applied, its SHA-256 digest is recorded with a 5-second TTL
+   *before* the clipboard is written. Any poll that races in between the write
+   and the state update is recognized as an echo. The previous clipboard value
+   is suppressed briefly (1.5 s) too, which swallows reads that were already in
+   flight when the remote update landed. Entries expire, so deliberately copying
+   the same content again later still propagates.
 4. **Origin stamping and dedupe.** Every frame carries `origin` and a unique
    `id`. The server never forwards a message to the peer it came from, and the
    phone drops any frame whose `origin` is its own id. Both sides keep a
@@ -174,13 +211,27 @@ pip install -r requirements.txt
 python -m crosscopy --token "choose-a-secret"
 ```
 
-The app prints the exact URL to type into the phone:
+The app prints the exact URL to type into the phone, then shows a **system tray
+icon** (look in the notification area, possibly under the `^` overflow):
 
 ```
 14:03:11  INFO    CrossCopy desktop 'DESKTOP-ABC' listening on 0.0.0.0:8765
 14:03:11  INFO      phone URL: ws://192.168.100.15:8765?token=choose-a-secret
 14:03:11  INFO    watching the clipboard every 0.35s
+14:03:11  INFO    tray icon visible
 ```
+
+**Tray menu**
+
+| Item | What it does |
+| --- | --- |
+| *Waiting for a phone* / *Connected to 1 phone* | Live status; the line under it names the phone. |
+| *Copy pairing link* | Puts `ws://<lan-ip>:<port>?token=…` on the clipboard (double-click the icon too). |
+| *Open log* | Opens `%LOCALAPPDATA%\CrossCopy\crosscopy.log`. |
+| *Start with Windows* (checkbox) | Adds/removes the per-user autostart entry. |
+| *Quit CrossCopy* | Stops the server and exits. |
+
+Closing the terminal window also stops it; there is no window to close.
 
 Notes:
 
@@ -189,9 +240,80 @@ Notes:
 - Find the IP manually with `ipconfig` (the `Wi-Fi` adapter's IPv4 address)
   if the printed one is from a virtual adapter.
 - Flags: `--host`, `--port`, `--token` (or `CROSSCOPY_TOKEN`), `--name`,
-  `--poll-interval`, `--no-share-on-connect`, `--verbose`.
+  `--poll-interval`, `--no-share-on-connect`, `--verbose`, `--no-tray`,
+  `--install-startup`, `--uninstall-startup`, `--startup-status`.
 - The token is optional, but without it any device on the Wi-Fi can read or
   replace your clipboard. The server warns at startup when it is missing.
+- If a run seems to do nothing, read the log file: every start, connection and
+  error is recorded there, including when a second instance is refused.
+
+### 3.1a Build a silent `CrossCopy.exe` and start it with Windows
+
+A packaged build is the right way to get seamless startup: `python -m crosscopy`
+always needs a console window, and a `.cmd`/shortcut in the Startup folder opens
+one. PyInstaller's `--windowed` build has no console at all, and the app logs to
+`%LOCALAPPDATA%\CrossCopy\crosscopy.log` instead.
+
+```bat
+cd desktop
+.venv\Scripts\activate
+pip install pyinstaller
+pyinstaller --noconfirm CrossCopy.spec
+```
+
+`CrossCopy.spec` already embeds the tray icon and marks the exe as windowed. The
+result is a single file:
+
+```
+desktop\dist\CrossCopy.exe
+```
+
+Register it for login (per-user, no administrator prompt):
+
+```bat
+desktop\dist\CrossCopy.exe --install-startup
+```
+
+Verify / remove:
+
+```bat
+desktop\dist\CrossCopy.exe --startup-status
+:: enabled
+::   "C:\…\desktop\dist\CrossCopy.exe"
+
+desktop\dist\CrossCopy.exe --uninstall-startup
+```
+
+The entry is a plain `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+value, so it is visible in Task Manager → Startup and can be toggled from the
+tray checkbox. If you move the exe, re-run `--install-startup`.
+
+> **Why a build is needed:** Windows can start `pythonw.exe launcher.py` at
+> login without any extra package, but that depends on this folder and the venv
+> staying in place, and any import error is invisible. The exe is self-contained
+> and is what the tests below were run against.
+> A windowed exe starts in ~6 s on the first launch (PyInstaller unpacks it and
+> Defender scans it); later launches are faster.
+
+> The `--windowed` flag is what suppresses the console. If you ever see a black
+> window, you built `CrossCopyDebug.spec` instead — that variant is deliberately
+> console-enabled for reading tracebacks.
+
+**Faster login start (one folder instead of one file).** A onefile exe unpacks
+itself on every launch (≈6 s warm, longer while Defender scans a fresh build).
+If that matters, build the folder variant and register that exe instead:
+
+```bat
+cd desktop
+.venv\Scripts\pyinstaller --noconfirm --windowed --onedir --name CrossCopy ^
+  --icon assets\crosscopy.ico --add-data "assets;assets" ^
+  --hidden-import pystray._win32 launcher.py
+
+dist\CrossCopy\CrossCopy.exe --install-startup
+```
+
+It is still a silent, windowless app; it just starts in about a second. Keep the
+whole `dist\CrossCopy` folder together when you move it.
 
 ### 3.2 Phone (Android)
 
@@ -261,8 +383,9 @@ flutter test
   while its UI is in the foreground and pauses when backgrounded; incoming text
   from the desktop is still written immediately. There is no reliable way around
   this without an accessibility/IME integration, which is out of scope.
-- **Plain text only.** Images, HTML and files are ignored (the desktop replies
-  with an `unsupported_kind` error).
+- **Text and images only.** HTML, rich text and files are ignored (the desktop
+  replies with an `unsupported_kind` error). An image that is larger than 8 MiB
+  as PNG is skipped with a warning rather than blocking the connection.
 - **No encryption.** Traffic is unencrypted WebSocket on your LAN. Use the token,
   trust your network, and never expose the port to the internet.
 - **One desktop per phone.** The app connects to a single laptop; the hub
@@ -271,7 +394,7 @@ flutter test
   because the app has to read the clipboard to detect changes.
 - **Change latency** is bounded by polling: ~0.35 s on Windows, ~0.6 s on
   Android.
-- Clipboard history, global hotkeys and a tray UI are not part of Phase 1.
+- Clipboard history and global hotkeys are not implemented (the tray icon is).
 
 ---
 
@@ -280,13 +403,13 @@ flutter test
 The design keeps transport and echo-suppression independent of content:
 
 1. **Protocol.** Add `CONTENT_FILES = "files"` to `SUPPORTED_CONTENT_KINDS`
-   (Python) and accept it in `SyncMessage.clipboardText`'s counterpart (Dart).
-   Add a capability name (e.g. `"files"`) to the `welcome` payload; the phone
-   shows the feature only when the desktop advertises it.
-2. **Clipboard layer.** Add `read_files()` / `write_files()` to
-   `ClipboardBackend` and `ClipboardSyncCore`. Manifest text stays the same;
-   only the payload branch changes. Keep digests over content, not over data
-   that changes per transfer.
+   (Python) and a matching `FilesClip` in `ClipContent` (Dart). The capability
+   list in `welcome` already travels from `SUPPORTED_CONTENT_KINDS`, so the
+   phone only offers what the desktop supports.
+2. **Clipboard layer.** Add a `files` variant to `Clip`, `read_item()` and
+   `write_item()`; `ClipboardSyncCore` needs no changes because it already works
+   on content digests rather than strings. Keep digests over content, not over
+   data that changes per transfer.
 3. **Chunking.** Send file payloads as `file.offer` → `file.chunk` →
    `file.complete` messages using the same `id` for correlation, or stream
    binary frames on the same socket. The envelope, replay window and

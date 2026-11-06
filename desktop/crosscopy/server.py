@@ -16,15 +16,15 @@ from websockets.http11 import Headers, Request, Response
 from . import protocol
 from .config import Settings, lan_addresses
 from .hub import Hub, Peer
-from .protocol import MAX_FRAME_BYTES, Message, MessageType, ProtocolError
+from .protocol import MAX_FRAME_BYTES, Clip, Message, MessageType, ProtocolError
 
 logger = logging.getLogger("crosscopy.server")
 
 HELLO_TIMEOUT = 10.0
 _PEER_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
-OnRemoteText = Callable[[Peer, str], Awaitable[bool]]
-ReadLocalClipboard = Callable[[], Awaitable[str | None]]
+OnRemoteClip = Callable[[Peer, Clip], Awaitable[bool]]
+ReadLocalClipboard = Callable[[], Awaitable[Clip | None]]
 
 
 class SyncServer:
@@ -33,12 +33,12 @@ class SyncServer:
         settings: Settings,
         hub: Hub,
         *,
-        on_remote_text: OnRemoteText,
+        on_remote_clip: OnRemoteClip,
         read_local_clipboard: ReadLocalClipboard,
     ) -> None:
         self._settings = settings
         self._hub = hub
-        self._on_remote_text = on_remote_text
+        self._on_remote_clip = on_remote_clip
         self._read_local_clipboard = read_local_clipboard
         self._stop = asyncio.Event()
         #: Set once the listening socket is bound (handy for tests and embedding).
@@ -175,10 +175,10 @@ class SyncServer:
         )
 
         if self._settings.share_on_connect:
-            text = await self._read_local_clipboard()
-            if text:
-                await peer.send(protocol.make_snapshot(self._hub.id, text))
-                logger.debug("sent current desktop clipboard to %s", peer.name)
+            clip = await self._read_local_clipboard()
+            if clip is not None:
+                await peer.send(protocol.make_clip_snapshot(self._hub.id, clip))
+                logger.debug("sent current desktop clipboard (%s) to %s", clip.describe(), peer.name)
 
         return peer
 
@@ -219,12 +219,12 @@ class SyncServer:
             await peer.send(protocol.make_error(self._hub.id, exc.code, exc.detail, message.id))
 
     async def _handle_clipboard_update(self, peer: Peer, message: Message) -> None:
-        text = protocol.extract_text(message)
+        clip = protocol.extract_clip(message)
         # Never trust the origin supplied by a client; stamp the authenticated id.
         stamped = message.with_origin(peer.id)
 
         try:
-            changed = await self._on_remote_text(peer, text)
+            changed = await self._on_remote_clip(peer, clip)
         except Exception as exc:
             logger.warning("could not apply clipboard from %s: %s", peer.name, exc)
             await peer.send(
@@ -234,25 +234,25 @@ class SyncServer:
 
         delivered = await self._hub.broadcast(stamped, exclude=(peer.id,))
         logger.info(
-            "clipboard from %s: %d chars -> %d other device(s)%s",
+            "clipboard from %s: %s -> %d other device(s)%s",
             peer.name,
-            protocol.text_size(text),
+            clip.describe(),
             delivered,
             "" if changed else " (local clipboard unchanged)",
         )
         await peer.send(protocol.make_ack(self._hub.id, stamped))
 
     async def _handle_share_request(self, peer: Peer, message: Message) -> None:
-        text = await self._read_local_clipboard()
-        if not text:
+        clip = await self._read_local_clipboard()
+        if clip is None:
             await peer.send(
                 protocol.make_error(
-                    self._hub.id, "empty_clipboard", "desktop clipboard has no text", message.id
+                    self._hub.id, "empty_clipboard", "desktop clipboard is empty", message.id
                 )
             )
             return
-        await peer.send(protocol.make_snapshot(self._hub.id, text))
-        logger.info("sent desktop clipboard to %s on request", peer.name)
+        await peer.send(protocol.make_clip_snapshot(self._hub.id, clip))
+        logger.info("sent desktop clipboard (%s) to %s on request", clip.describe(), peer.name)
 
     # -- misc --------------------------------------------------------------
 
